@@ -18,7 +18,7 @@ RAGFlow is an open-source RAG (Retrieval-Augmented Generation) engine based on d
 
 RAGFlow runs as **two separate Python process types**, orchestrated by `docker/launch_backend_service.sh`:
 
-- **API Server** (`api/ragflow_server.py`): Quart-based async HTTP server
+- **API Server** (`api/ragflow_server.py`): Quart-based async HTTP server handling HTTP requests
 - **Task Executors** (`rag/svr/task_executor.py`): Background workers processing documents from Redis streams. Multiple instances run in parallel (controlled by `WS` env var). Each consumes from priority-ordered Redis streams (`te.1.common`, `te.0.common`), using consumer groups for load distribution.
 
 Key consequence: task executors import a different code surface than the API server, so always check which process a module is meant for.
@@ -26,10 +26,11 @@ Key consequence: task executors import a different code surface than the API ser
 ### Backend API (`/api/`)
 
 - **App factory**: `api/apps/__init__.py` — creates the Quart app, configures auth (`login_required` decorator, JWT + API token + session fallback), and dynamically discovers/registers blueprints
-- **Two API coexisting patterns**:
+- **Three API patterns**:
   - **RESTful APIs** in `api/apps/restful_apis/` — newer pattern with Pydantic request validation, service layer in `api/apps/services/`, routes registered under `/api/v1`
   - **Legacy APIs** in `api/apps/*_app.py` — older pattern using `@validate_request()`, routes registered under `/v1/<page_name>`
   - **SDK APIs** in `api/apps/sdk/` — registered under `/v1/`
+- **Route registration**: Automatically discovered from files in `api/apps/restful_apis/`, `api/apps/sdk/`, and `api/apps/*_app.py`. Each file creates a Blueprint named `manager` and defines routes using `@manager.route()`
 - **Services**: `api/db/services/` — business logic wrapping Peewee model operations. `api/apps/services/` — service layer for the RESTful APIs
 - **Models**: `api/db/db_models.py` — Peewee ORM models with pooled MySQL/PostgreSQL connections, custom `JSONField`/`ListField` types, retry logic on connection loss
 
@@ -73,7 +74,7 @@ uv sync --python 3.13 --all-extras
 uv run python3 download_deps.py
 pre-commit install
 
-# Start dependent services
+# Start dependent services (MySQL, Redis, Elasticsearch/Infinity, MinIO)
 docker compose -f docker/docker-compose-base.yml up -d
 
 # Run backend (requires services to be running)
@@ -82,9 +83,13 @@ export PYTHONPATH=$(pwd)
 bash docker/launch_backend_service.sh
 
 # Run tests
-uv run pytest
+uv run pytest                                    # Run all tests
+uv run pytest -m p1                             # Run priority 1 tests only
+uv run pytest -m p2                             # Run priority 2 tests only
+uv run pytest path/to/test_file.py              # Run specific test file
+uv run pytest path/to/test_file.py::test_func   # Run specific test function
 
-# Linting
+# Linting and formatting
 ruff check
 ruff format
 ```
@@ -133,6 +138,51 @@ RAGFlow supports switching between Elasticsearch (default) and Infinity:
 
 - Set `DOC_ENGINE=infinity` in `docker/.env` to use Infinity
 - Requires container restart: `docker compose down -v && docker compose up -d`
+
+## Query Flow Architecture
+
+When a user sends a chat message, the flow is:
+
+1. **Frontend**: React Query hook (`use-chat-request.ts`) → Service layer (`next-chat-service.ts`) → Axios client (`next-request.ts`) → `POST /api/v1/chat/completions`
+2. **Backend Route**: `api/apps/restful_apis/chat_api.py::session_completion()` handles auth, loads chat/session, calls `async_chat()`
+3. **Chat Orchestration**: `api/db/services/dialog_service.py::async_chat()`:
+   - Loads models via `LLMBundle` (embedding, LLM, rerank, TTS)
+   - Performs retrieval via `rag/nlp/search.py::Dealer` (vector + BM25 + rerank)
+   - Constructs prompt with retrieved knowledge
+   - Streams response via `LLMBundle.async_chat_streamly_delta()`
+4. **Response**: SSE stream back to frontend with answer chunks and references
+
+## Frontend Conventions
+
+### CSS and Layout Debugging
+When fixing CSS/layout issues (especially flex truncation, ellipsis, or element sizing), **always inspect the full parent hierarchy** for `flex-shrink`, `min-width`, and `overflow` constraints before applying fixes like `min-w-0`.
+
+### Query Key Factory (Mandatory)
+**Never write raw `queryKey` arrays inline.** Always use a query key factory object that returns `as const` tuples:
+
+```ts
+// ❌ Bad — raw array
+queryClient.invalidateQueries({
+  queryKey: [LLMApiAction.AddedProviders, params.provider_name],
+});
+
+// ✅ Good — factory reference
+queryClient.invalidateQueries({
+  queryKey: LlmKeys.instanceModels(params.provider_name, params.instance_name),
+});
+```
+
+### Network Request Layering
+HTTP requests are organized in three layers. **Never import `@/utils/request`, `@/utils/next-request`, or `@/utils/api` directly inside a hook**:
+1. `src/hooks/use-xx-request.ts(x)` — React Query hooks; only call the service layer
+2. `src/services/xx-service.ts` — Register endpoints via `registerNextServer`
+3. `src/utils/next-request.ts` — The single axios instance
+
+### Shared UI Component Lock
+The folder `src/components/ui/` is the project's **shared UI library**. **Do not modify** any file under it. If a component doesn't meet requirements, **wrap or compose it** in a new component outside this folder.
+
+### i18n Style
+For `en.ts`: Use sentence case — first word capitalized, rest lowercase (e.g., `referenceAnswer: 'Reference answer'`). Proper nouns remain as-is.
 
 ## Development Environment Requirements
 
